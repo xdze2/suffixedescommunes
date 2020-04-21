@@ -250,7 +250,7 @@ for suffix, c, vbe in VBE_k+uniqueletter:
 
 from glob import glob
 
-filepath = glob('one_by_one/*.png')
+filepath = sorted( glob('one_by_one/*.png') )
 
 
 # +
