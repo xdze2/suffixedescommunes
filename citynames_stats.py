@@ -17,7 +17,7 @@
 import numpy as np
 import csv
 import matplotlib.pylab as plt
-from collections import Counter
+from collections import Counter, defaultdict
 import random
 
 # # Carte des communes françaises ayant un même suffixe
@@ -27,25 +27,32 @@ import random
 #
 
 filename = "data/code-insee-postaux-geoflar.csv"
+# source:
 # https://public.opendatasoft.com/explore/dataset/code-insee-postaux-geoflar/export/
 
-with open(filename, 'r') as csvfile:  # python 3: 'r',newline=""
+# +
+with open(filename, 'r') as csvfile:
+    # detect delimiter
     dialect = csv.Sniffer().sniff(csvfile.read(2024), delimiters=";,")
     csvfile.seek(0)
     reader = csv.reader(csvfile, dialect)
     header = reader.__next__()
     data = {key:col for key, col in zip(header, zip(*[line for line in reader]))}
-
+    
 print(len(list(data.values())[0]), 'rows')
+# -
+
 print('> Columns:')
 print(', '.join( data.keys() ))
 
 
 # +
-# Extract data
+# -- Extract data --
 def remove_parenthesis(n):
     # remove parenthesis, example 'Castillon (Canton de Lembeye)'
     return n.split('(')[0].strip()
+
+# note: paris-2e-arrondissement, marseille--5e--arrondissement, ...
 
 name_xy = {}
 for code, name, x, y in zip(data['CODE INSEE'], data['Nom Commune'],
@@ -59,7 +66,7 @@ for code, name, x, y in zip(data['CODE INSEE'], data['Nom Commune'],
     except ValueError:
         pass
     
-print(len(name_xy))
+print('nbr of names:', len(name_xy))
 
 names = [n for n, xy in name_xy.values()]
 # -
@@ -75,121 +82,151 @@ for part in nouns:
     c = len([n for n in names if part in n])
     print(part, f'\t{c:>5}')
 
-# +
-select = [n for n in names if n.endswith('lieu')]
-print(len(select))
+# Noms les plus long :
+print('\n'.join( sorted(names, key=len, reverse=True)[:10]))
 
-print( select[:100] )
-# -
-
-sorted(names, key=len, reverse=True)[:10]
-
+# et les plus courts :
 sorted(name_xy.items(), key=lambda x:len(x[1][0]), reverse=False)[:10]
 
-# ## 2. Recherche des suffixes
+# ## 2. Recherche automatique des suffixes
 #
-# branching entropy:  https://www.aclweb.org/anthology/P12-2075.pdf
+# using branching entropy:  https://www.aclweb.org/anthology/P12-2075.pdf  
+# see https://pypi.org/project/eleve/
 
 # +
-# pre-compute counters of n-grams (suffix)
-len_max = 15
-count_k = [Counter( (n[-k:] for n in names if len(n)>=k) )
-           for k in range(1, len_max)]
-alphabet = sorted( count_k[0].keys() )
+# -- Pre-compute counts for each n-grams (suffix) --
 
-# print summary
-for k, counter in enumerate(count_k):
-    print(f'{k+1:>3}',
-          f'{len(counter):>7}',
-          #f'{entropy(counter):>7.2f}', 
-          ', '.join(u[0] for u in counter.most_common()[:4]))
+suffix_max_size = 15  #  <-- max length of searched n-grams
 
+suffix_counter = Counter({'':len(names)})
+for k in range(1, suffix_max_size):
+    suffix_counter.update( (n[-k:] for n in names if len(n)>=k ) )
+# -
+
+alphabet = Counter( (letter for n in names for letter in n) )
 
 # +
-def get_count(suffix):
-    n = len(suffix) - 1
-    return count_k[n][suffix]
-
 left_entropy_store = {}
 def left_entropy(suffix):
-    """Left Branching Entropy"""
+    """Left Branching Entropy
+    
+       considering the probability distribution p( letter+suffix | suffix )
+       
+       p( letter+suffix | suffix ) = #(letter+suffix)/#(suffix)
+    """
     if suffix in left_entropy_store:
-        return left_entropy_store[suffix]
+        left_entropy = left_entropy_store[suffix]
     else:
-        n_suffix = get_count(suffix)
+        n_suffix = suffix_counter[suffix]
             
-        if n_suffix < 1:
-            left_entropy = 0
+        if n_suffix < 20:  # <-- min number of counts to do stats
+            left_entropy = np.NaN
         else:
             # probabilty p(letter | suffix)
-            p_left = (get_count(letter+suffix)/n_suffix for letter in alphabet)
+            p_left = (suffix_counter[letter+suffix]/n_suffix
+                      for letter in alphabet.keys())
             p_left = np.array([p for p in p_left if p > 0])
             left_entropy = -np.sum( p_left*np.log(p_left) )
+        
+        left_entropy_store[suffix] = left_entropy
             
-            left_entropy_store[suffix] = left_entropy
-        return left_entropy
+    return left_entropy
 
 def VBE(suffix): 
     """Variation of Branching Entropy"""
     return left_entropy(suffix) - left_entropy(suffix[1:])
 
-def compute_VBE_avg(k):
+def compute_VBE_avg_notused(k):
     """mean of the Variation of Branching Entropy for k-grams"""
     total = sum(count_k[k].values())
-    mu = sum(VBE(suffix)*count for suffix, count in count_k[k].items() if count>100)
+    mu = sum(VBE(suffix)*count for suffix, count in count_k[k].items())# if count>100)
     return mu / total
-
-# pre-compute average VBE_k
-VBE_avg = [compute_VBE_avg(k) for k in range(1, len(count_k))]
-print(VBE_avg)
-
-
 # -
 
-def normed_VBE(suffix):
-    return VBE(suffix) - VBE_avg[len(suffix)]
 
 
 # +
-VBE_k = [(suffix, count, normed_VBE(suffix)) for k in range(1, 12)
-         for suffix, count in count_k[k].most_common()[:70] ]
+# -- Compute average VBE for k-grams, for every k -- 
+weighted_sum = defaultdict(int)
+weighted_count = defaultdict(int)
+for suffix, count in suffix_counter.items():
+    vbe = VBE(suffix)
+    if not np.isnan(vbe):
+        weighted_count[len(suffix)] += count
+        weighted_sum[len(suffix)] += vbe*count
 
-VBE_k = [vbe for vbe in VBE_k if vbe[2] > 0 and vbe[1]>60]
+avg_vbe = {k:vbe/weighted_count[k] for k, vbe in weighted_sum.items()}
+
+def normed_VBE(suffix):
+    return VBE(suffix) - avg_vbe[len(suffix)]
+
+
+# -
+
+normed_VBE('ard')
+
+# +
+# Compute normed VBE for each suffix
+VBE_k = [(suffix, count, normed_VBE(suffix))
+         for suffix, count in suffix_counter.items()
+         if count > 50]
+
+# Sort and filter
+VBE_k = [vbe for vbe in VBE_k if vbe[2] > 0]
 VBE_k = sorted(VBE_k, key=lambda x:x[2], reverse=True)
 # -
 
-VBE_k
+VBE_k[:150]
+
+# +
+## Test Graph
+# -
+
+import altair as alt
+import pandas as pd
+
+# +
+suffix, count, vbe = zip(*VBE_k)
+
+chartdata = pd.DataFrame({'suffix': suffix,
+                          'count':count,
+                          'vbe':vbe})
+chart = alt.Chart(chartdata)
+
+alt.Chart(chartdata).mark_point().encode(
+    alt.X('count', scale={'type':'log', 'base':10}),
+    alt.Y('vbe'),
+    alt.Tooltip('suffix')
+)
+# -
 
 # ## 3. Dessin des cartes
 
-# !mkdir images/vbe
+# !mkdir one_by_one
 
-xy_choices = [xy for n, xy in name_xy.values()]
-
-i = 1
-a, b = min(xy_choices, key=lambda x:x[i])[i], max(xy_choices, key=lambda x:x[i])[i]
-
-L = 11400
-
-uniqueletter = [(n, c, 0) for n, c in count_k[0].items()
-                if c > 60]
+uniqueletter = [(a, suffix_counter[a], 0) for a in alphabet
+                if suffix_counter[a] > 60]
 
 for suffix, c, vbe in VBE_k+uniqueletter:
-    if c < 60 or not suffix:
+    # filter
+    if c < 60 or not suffix or vbe < 0.21:
         continue
+    
     print(suffix+' '*10, end='\r')
+    
     fig = plt.figure(figsize=(7, 7));
     ax = fig.add_axes([0., 0., 1., 1 ])
     margin = 300
     ax.axis([1009.5-margin, 12409.5+margin, 60130.5-margin, 71530.5+margin]);
     ax.axis('off')
+    # background
     xy_choices = [xy for n, xy in name_xy.values()]
     ax.plot(*zip(*xy_choices), ',',
              color= 'black',
              alpha= 0.25,
              markersize=1,
              label=f'-{suffix}');
-
+    # points
     xy_choices = [xy for n, xy in name_xy.values() if n.endswith(suffix)]
     ax.plot(*zip(*xy_choices),
              color='firebrick',
@@ -197,10 +234,8 @@ for suffix, c, vbe in VBE_k+uniqueletter:
              markersize=1, marker='s', linestyle='',
              label=f'-{suffix}');
 
+    # legend
     count = len(xy_choices)
-    #plt.axis('equal'); #plt.title(f'{c} communes avec comme suffix -{suffix}');
-    #text_params = {'ha': 'center', 'va': 'center', 'family': 'sans-serif',
-    #               'fontweight': 'bold'
     ax.text(4300, 70400, f'*{suffix}', fontsize=16,
              fontweight='bold', family='monospace',
              color='firebrick', ha='right')
@@ -208,47 +243,34 @@ for suffix, c, vbe in VBE_k+uniqueletter:
              fontweight='normal', family='monospace',
              color='firebrick', ha='right', alpha=.9)
     #plt.tight_layout();
-    plt.savefig(f"images/vbe/{''.join(suffix[::-1])}_{count}.png")
+    plt.savefig(f"one_by_one/{''.join(suffix[::-1])}_{count}.png")
     
     #break
     plt.close();
 
-suffix = 'abc'
+from glob import glob
 
-''.join(suffix[::-1])
+filepath = glob('one_by_one/*.png')
 
-# ## map all k-endgram 
 
-k = 1
-for suffix, c in count_k[k-1].items():
-    if c < 200 or not suffix:
-        continue
-    print(suffix, end='\r')
-    plt.figure(figsize=(8, 8));
+# +
+def reverse_suffix(path):
+    suffix = path.split('/')[-1].split('_')[0]
+    return suffix[::-1]
 
-    xy_choices = [xy for n, xy in name_xy.values() if random.random()>.0]
-    plt.plot(*zip(*xy_choices), ',',
-             color='black',
-             alpha=.25,
-             markersize=1,
-             label=f'-{suffix}');
+path = 'one_by_one/rem-rus-_100.png'
+reverse_suffix(path)
 
-    xy_choices = [xy for n, xy in name_xy.values() if n.endswith(suffix)]
-    plt.plot(*zip(*xy_choices),
-             color='firebrick',
-             alpha=.8,
-             markersize=1, marker='s', linestyle='',
-             label=f'-{suffix}');
-    
+# +
+# generate .md file
+text = '\n'.join([f'### *{reverse_suffix(path)}  \n ![{reverse_suffix(path)}]({path})'
+                  for path in filepath])
 
-    plt.axis('equal'); plt.title(f'suffix -{suffix}  {c} villes');
-    plt.axis(False);
-    plt.tight_layout();
-    plt.savefig(f'images/{len(suffix)}/france_{suffix}.png')
-    
-    plt.close();
+with open("almost_all.md", 'w') as file: 
+    file.write(text) 
+# -
 
-# ## test Map
+# ## Mutliple Map
 
 import matplotlib.colors as mcolors
 
@@ -258,46 +280,34 @@ colors = list(mcolors.TABLEAU_COLORS.keys())
 
 print( colors )
 
-
-def pick_a_color():
-    return random.choice(colors)
-
-
-def plot_points(suffix, color):
-    xy_choices = [xy for n, xy in name_xy.values() if n.endswith(suffix)]
-    plt.plot(*zip(*xy_choices), '.',
-             color=color,
-             alpha=.8,
-             markersize=3,
-             label=f'-{suffix}');
-
-
-# +
-plt.figure(figsize=(8, 8));
-
-plot_points('o', pick_a_color())
-plot_points('m', pick_a_color())
-plot_points('ville', pick_a_color())
-plot_points('ieu', 'xkcd:blue')
-plot_points('ac', pick_a_color())
-plot_points('y', pick_a_color())
-
-plot_points('ix', 'yellow')
-
-plt.axis('equal'); plt.legend();
-# -
-
 selection = ['ville', 'heim', 'court', 'a', 'o', 'ac', 'ieu',
              '-sur-mer', 'ing',  'ans', 'i', 'loire']
 #selection = ['loire', 'rhone', 'a', 'o']
 
+def plot_points(suffix, color, xy, alpha=0.9):
+    
+    xy_choices = [xy for n, xy in name_xy.values() if n.endswith(suffix)]
+    ax.plot(*zip(*xy_choices),
+             color=color,
+             alpha=alpha,
+             markersize=1, marker='s', linestyle='',
+             label=f'-{suffix}');
+
+    ax.text(*xy, f'*{suffix}', fontsize=16,
+             fontweight='bold', family='monospace',
+             color=color, ha='right', alpha=alpha)
+
+
 # +
+
 fig = plt.figure(figsize=(7, 7));
 ax = fig.add_axes([0., 0., 1., 1 ])
 
 margin = 300
-ax.axis([1009.5-margin, 12409.5+margin, 60130.5-margin, 71530.5+margin]);
+ax.axis([1009.5-3*margin, 12409.5+margin, 60130.5-margin, 71530.5+margin]);
 ax.axis('off')
+
+# background
 xy_choices = [xy for n, xy in name_xy.values()]
 ax.plot(*zip(*xy_choices), ',',
          color= 'black',
@@ -305,38 +315,38 @@ ax.plot(*zip(*xy_choices), ',',
          markersize=1,
          label=f'-{suffix}');
     
-for k, suffix in enumerate(selection):
+plot_points('y', 'tab:gray', (7200, 71300), alpha=.7)
+plot_points('ville', 'tab:purple',  (5400, 71200), alpha=.5)
 
-    #print(suffix+' '*10, end='\r')
-    color = colors[k % len(colors)]
+plot_points('a', 'tab:red', (10400, 66200))
+plot_points('-sur-mer', 'tab:blue', (5400, 70200))
+plot_points('ing', 'tab:orange', (10400, 69500))
+plot_points('ec', 'tab:cyan', (1700, 69000))
+plot_points('ac', 'tab:brown', (2700, 64000))
+plot_points('willer', 'tab:red', (12100, 69000))
+plot_points('heim', 'tab:pink', (12000, 67800))
+plot_points('an', 'tab:pink', (2700, 63400))
+plot_points('ans', 'tab:green', (10900, 66700))
+plot_points('os', 'tab:green', (2700, 62800))
 
-    xy_choices = [xy for n, xy in name_xy.values() if n.endswith(suffix)]
-    ax.plot(*zip(*xy_choices),
-             color=color,
-             alpha=.9,
-             markersize=1, marker='s', linestyle='',
-             label=f'-{suffix}');
+plot_points('ieu', 'tab:red', (10800, 65200))
 
-    #count = len(xy_choices)
-    #plt.axis('equal'); #plt.title(f'{c} communes avec comme suffix -{suffix}');
-    #text_params = {'ha': 'center', 'va': 'center', 'family': 'sans-serif',
-    #               'fontweight': 'bold'
-    ax.text(2300, 66800 - k*350, f'*{suffix}', fontsize=16,
-             fontweight='bold', family='monospace',
-             color=color, ha='right')
-    #ax.text(4300, 70050, f'{count} communes', fontsize=11,
-    #         fontweight='normal', family='monospace',
-    #         color='firebrick', ha='right', alpha=.9)
-    #plt.tight_layout();
-    #plt.savefig(f'images/vbe/{suffix}.png')
-    
-    #break
-    #plt.close();
+plot_points('at', 'tab:blue', (11400, 65800))
+plot_points('court', 'tab:olive', (9300, 70300))
 
+plot_points('-sur-seine', 'tab:red', (5400, 70700))
+plot_points('-sur-loire', 'tab:red', (2800, 66400))
+
+plot_points('o', 'tab:blue', (11400, 60800))
+plot_points('i', 'tab:green', (11400, 61200))
+
+
+#plt.tight_layout();
+plt.savefig('not_all_suffix.png')
 
 # -
 
-# ## Draft
+# ## Test VBE 
 
 def entropy(counter):
     count = np.array(list( counter.values() ))
@@ -361,7 +371,8 @@ print("  ratio", entropy(k_grams)/np.log( len(k_grams) )*100)
 
 
 def count_from_ends(ends):
-    lastcounter = Counter( n[len(n)-len(ends)-1:len(n)-len(ends)] for n in names if n.endswith(ends) )
+    lastcounter = Counter( n[len(n)-len(ends)-1:len(n)-len(ends)]
+                          for n in names if n.endswith(ends) )
     #print(len(lastcounter))
     return lastcounter
 
@@ -380,13 +391,14 @@ ratio = 2.51/2/100
 print(bar_chart(ratio))
 
 # +
-ends = '-sur-loire'
+ends = 'lle'
 last = count_from_ends(ends)
 print("suffix:", f'-{ends}')
 nbr = sum(last.values())
 print("   nbr:", nbr)
 print("     e=", entropy(last))
-d = [(letter, c, entropy(count_from_ends(letter+ends))) for letter, c in last.items()]
+d = [(letter, c, entropy(count_from_ends(letter+ends)))
+     for letter, c in last.items()]
 d = sorted(d, key=lambda x:x[2], reverse=False)
 
 count_max = max(u[1] for u in d)
