@@ -5,3 +5,4 @@
 
 - [allmost all maps one by one](./almost_all.md)
 - [the notebook](./citynames_stats.py)
+- canton par canton ?
